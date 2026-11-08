@@ -221,10 +221,65 @@ const $ = id => document.getElementById(id);
 // ── 충돌 격자 ─────────────────────────────────────────
 const walk = new Uint8Array(GW * GH);
 { const bin = atob(GRID_B64); for (let i = 0; i < GW * GH; i++) walk[i] = (bin.charCodeAt(i >> 3) >> (7 - (i & 7))) & 1; }
+// 유령 덩어리 없애기: 복도 양쪽이 다 통로인데 가운데를 막고 있고, 그 자리에 벽·기둥·계단 모델이 하나도 없는 작은 덩어리는
+// 화면엔 아무것도 없는데 막히는 투명벽이라 걸어갈 수 있게 연다. (예: 2층 3-5반 앞 창가 복도를 통째로 막던 덩어리)
+const OPENED = [];
+{
+  const box = [...D3.walls.map(([x0, y0, x1, y1]) => [x0, y0, x1, y1]), ...D3.pillars.map(([x, y]) => [x - 1.6, y - 1.6, x + 1.6, y + 1.6])];
+  const stairBox = [...DATA.lanes.map(L => [L.x0, L.y0, L.x1, L.y1]), ...Object.values(DATA.stairs).flatMap(per => Object.values(per))];
+  const near = (list, i, T) => { const x0 = (i % GW) * C, y0 = Math.floor(i / GW) * C; return list.some(b => b[0] - T < x0 + C && b[2] + T > x0 && b[1] - T < y0 + C && b[3] + T > y0); };
+  const W = (gx, gy) => gx >= 0 && gy >= 0 && gx < GW && gy < GH && walk[gy * GW + gx] === 1;
+  const U = new Uint8Array(GW * GH);
+  for (let i = 0; i < GW * GH; i++) { const gx = i % GW, gy = Math.floor(i / GW); if (!walk[i] && (W(gx - 1, gy) || W(gx + 1, gy) || W(gx, gy - 1) || W(gx, gy + 1)) && !near(box, i, 1.5)) U[i] = 1; }
+  const seen = new Uint8Array(GW * GH);
+  for (let i = 0; i < GW * GH; i++) {
+    if (!U[i] || seen[i]) continue;
+    const st = [i], cs = []; seen[i] = 1;
+    while (st.length) { const c = st.pop(); cs.push(c); for (const n of [c - GW, c + GW, c - 1, c + 1, c - GW - 1, c - GW + 1, c + GW - 1, c + GW + 1]) if (n >= 0 && n < GW * GH && U[n] && !seen[n]) { seen[n] = 1; st.push(n); } }
+    let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1; for (const c of cs) { const gx = c % GW, gy = Math.floor(c / GW); x0 = Math.min(x0, gx); y0 = Math.min(y0, gy); x1 = Math.max(x1, gx); y1 = Math.max(y1, gy); }
+    if (x1 - x0 < 1 || y1 - y0 < 1 || cs.length > 16 || cs.some(c => near(stairBox, c, 8))) continue;
+    let lr = false, ud = false;   // 양쪽 맞은편이 모두 통로인가 (통로를 막는 마개)
+    for (let gy = y0; gy <= y1; gy++) if (W(x0 - 1, gy) && W(x1 + 1, gy)) lr = true;
+    for (let gx = x0; gx <= x1; gx++) if (W(gx, y0 - 1) && W(gx, y1 + 1)) ud = true;
+    if (!lr && !ud) continue;
+    for (let gy = y0; gy <= y1; gy++) for (let gx = x0; gx <= x1; gx++) { const k = gy * GW + gx; if (!walk[k] && !near(box, k, 1.5)) { walk[k] = 1; OPENED.push(k); } }
+  }
+  // 벽(창) 선을 따라 튀어나온 턱: 같은 줄 양옆은 다 걸을 수 있는데 1~4칸만 막혀 있고, 그 자리를 가로지르는 벽·기둥이 없으면 메움
+  // → 창가에 바짝 붙어 걸어도 걸리지 않음
+  const wallsH = D3.walls.filter(([x0, y0, x1, y1]) => x1 - x0 >= y1 - y0).map(([x0, y0, x1, y1]) => [x0, y0, x1, y1]);
+  const wallsV = D3.walls.filter(([x0, y0, x1, y1]) => x1 - x0 < y1 - y0).map(([x0, y0, x1, y1]) => [x0, y0, x1, y1]);
+  const pil = D3.pillars.map(([x, y]) => [x - 1.6, y - 1.6, x + 1.6, y + 1.6]);
+  const posts = DATA.doors.flatMap(d => { const h = d.side === "N" || d.side === "S"; return [-1, 1].map(s => { const x = h ? d.p + s * 6 : d.line, y = h ? d.line : d.p + s * 6; return [x - 1, y - 1, x + 1, y + 1]; }); });
+  for (const horizRun of [true, false]) {
+    const along = horizRun ? wallsH : wallsV, across = horizRun ? wallsV : wallsH;
+    const N = horizRun ? GW : GH, M = horizRun ? GH : GW, idx = (m, k) => horizRun ? m * GW + k : k * GW + m;
+    const sideWalk = (m, k) => (m > 0 && walk[idx(m - 1, k)]) || (m < M - 1 && walk[idx(m + 1, k)]);
+    const okCell = (m, k) => { const c = idx(m, k); return sideWalk(m, k) && near(along, c, 6) && !near(across, c, 1.5) && !near(pil, c, 1.5) && !near(posts, c, 1) && !near(stairBox, c, 8); };
+    const corner = (m, k) => { const c = idx(m, k); return near(across, c, 1.5) || near(pil, c, 1.5) || near(posts, c, 1); };
+    for (const step of [1, -1]) for (let m = 0; m < M; m++) for (let k = step > 0 ? 1 : N - 2; step > 0 ? k < N - 1 : k > 0; k += step) {
+      if (walk[idx(m, k)] || !walk[idx(m, k - step)]) continue;
+      let e = k; const run = [];
+      while (e >= 0 && e < N && !walk[idx(m, e)] && run.length <= 12 && okCell(m, e)) { run.push(idx(m, e)); e += step; }
+      if (!run.length || run.length > 12 || e < 0 || e >= N) continue;
+      // 반대편도 통로로 이어지거나(턱), 기둥·가로벽·문틀 같은 보이는 모서리에서 끝나야(계단턱) 메움
+      if (walk[idx(m, e)] || corner(m, e)) for (const c of run) { walk[c] = 1; OPENED.push(c); }
+    }
+  }
+}
+// 계단은 입구로만: 계단 옆면 바로 바깥 칸(올라가는/내려가는 계단 사이 칸막이 자리 포함)을 막아서
+// 평지에서 계단 옆구리로 비스듬히 들어가거나 칸막이 위를 걷는 일이 없게 함. 입구 쪽 25%는 열어 둠
+const LANE_SIDES = [];   // [x0,y0,x1,y1] 계단 옆 난간 띠 (몸 중심이 이 안(+반지름)에 들어가면 막힘)
+for (const L of DATA.lanes) {
+  const axX = L.ax === "x", a0 = axX ? L.x0 : L.y0, a1 = axX ? L.x1 : L.y1, len = a1 - a0;
+  const lo = L.nearMin ? a0 + len * 0.25 : a0, hi = L.nearMin ? a1 : a1 - len * 0.25, W = 2.2;
+  if (axX) LANE_SIDES.push([lo, L.y0 - W, hi, L.y0], [lo, L.y1, hi, L.y1 + W]);
+  else LANE_SIDES.push([L.x0 - W, lo, L.x0, hi], [L.x1, lo, L.x1 + W, hi]);
+}
+const onLaneSide = (x, y, r) => { for (const b of LANE_SIDES) if (x > b[0] - r && x < b[2] + r && y > b[1] - r && y < b[3] + r) return true; return false; };
 const isWalk = (x, y) => { const gx = Math.floor(x / C), gy = Math.floor(y / C); return gx >= 0 && gy >= 0 && gx < GW && gy < GH && walk[gy * GW + gx] === 1; };
 const free = (x, y) => {
   const inside = laneAt(x, y) || roomAt(x, y), r = inside ? R_IN : R;
-  return isWalk(x - r, y - r) && isWalk(x + r, y - r) && isWalk(x - r, y + r) && isWalk(x + r, y + r) && !hitFurn(x, y, r, inside);
+  return isWalk(x - r, y - r) && isWalk(x + r, y - r) && isWalk(x - r, y + r) && isWalk(x + r, y + r) && !hitFurn(x, y, r, inside) && !onLaneSide(x, y, r * 0.6);
 };
 const floorOf = y => (y < 499 ? 1 : y < 1001 ? 2 : y < 1503 ? 3 : 4);
 const cellOf = (x, y) => Math.floor(y / C) * GW + Math.floor(x / C);
@@ -495,7 +550,7 @@ for (const L of LANES) {
   const pad = new THREE.Mesh(new THREE.PlaneGeometry(axX ? 3 : wid, axX ? wid : 3), padMat); pad.rotation.x = -Math.PI / 2; pad.position.set(nx, 0.3, ny); floorGroups[f].add(pad);
 }
 // ── 막힌 곳 메우기: 충돌 판정은 있는데 벽 모델이 없던 경계(투명벽) → 실내는 벽, 바깥(운동장 쪽)은 철망 펜스 ──
-const fenceRuns = [];
+const fenceRuns = [], FILLS = [];
 {
   const bl = [...D3.walls.map(([x0, y0, x1, y1]) => [x0, y0, x1, y1]), ...D3.pillars.map(([x, y]) => [x - 1.6, y - 1.6, x + 1.6, y + 1.6]), ...LANES.map(L => [L.x0, L.y0, L.x1, L.y1])];
   for (const d of DATA.doors) { const h = d.side === "N" || d.side === "S"; for (const s of [-1, 1]) { const x = h ? d.p + s * DW : d.line, y = h ? d.line : d.p + s * DW; bl.push([x - 0.6, y - 0.6, x + 0.6, y + 0.6]); } }
@@ -518,7 +573,7 @@ const fenceRuns = [];
       const mid = (s + e) / 2, len = e - s, f = floorOf(horiz ? line - dir : mid);
       const cx = horiz ? mid : line + dir * 0.7, cy = horiz ? line + dir * 0.7 : mid;
       if (outdoor(f, cx, cy)) fenceRuns.push({ cx, cy, len, horiz });
-      else P("wall", f, cx, WALL_H / 2, cy, horiz ? len : 1.4, WALL_H, horiz ? 1.4 : len);
+      else { P("wall", f, cx, WALL_H / 2, cy, horiz ? len : 1.4, WALL_H, horiz ? 1.4 : len); FILLS.push({ f, cx, cy, len, horiz }); }
     };
     for (let k = 1; k <= list.length; k++) { if (k < list.length && list[k] === e) { e += C; continue; } flush(); if (k < list.length) { s = list[k]; e = s + C; } }
   }
@@ -1360,7 +1415,7 @@ function loop(now) {
 }
 renderer.setAnimationLoop(loop);
 
-window.__game = { tick: loop, KIDS, walk, DATA, D3, bfs, goalsFor, nearStand, cellOf, GH, START, stand, useStairs, movePlayer, inRoom, free, laneAt, heightAt, LANES, get yaw() { return yaw; }, set yaw(v) { yaw = v; }, get S() { return S; }, TEACHERS, findPath, STAIRS, floorOf, cellXY, GW, C, ROOMS, view(y, p) { yaw = y; pitch = p; } };
+window.__game = { tick: loop, KIDS, FILLS, OPENED, walk, DATA, D3, bfs, goalsFor, nearStand, cellOf, GH, START, stand, useStairs, movePlayer, inRoom, free, laneAt, heightAt, LANES, get yaw() { return yaw; }, set yaw(v) { yaw = v; }, get S() { return S; }, TEACHERS, findPath, STAIRS, floorOf, cellXY, GW, C, ROOMS, view(y, p) { yaw = y; pitch = p; } };
 </script>
 
 </body></html>
